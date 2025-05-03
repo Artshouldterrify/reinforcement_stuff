@@ -1,0 +1,127 @@
+import gymnasium as gym
+from gymnasium.wrappers import RecordVideo, RecordEpisodeStatistics
+import torch
+from torch import nn
+import numpy as np
+from collections import namedtuple
+
+
+# defining an agent that acts randomly.
+class randomAgent:
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def act(environment):
+        return environment.action_space.sample()
+
+# Neural Network agent using torch.
+class NeuralNetworkAgent(nn.Module):
+    def __init__(self, input_size=4, layers=1, hidden_size=128, output_size=2):
+        super().__init__()
+        self.input_size = input_size
+        self.layers = layers
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.model = self.create_model()
+        return
+
+    def create_model(self):
+        model = nn.Sequential()
+        model.add_module("input", nn.Linear(self.input_size, self.hidden_size))
+        for i in range(self.layers):
+            model.add_module("hidden"+str(i), nn.Linear(self.hidden_size, self.hidden_size))
+            model.add_module("relu"+str(i), nn.ReLU())
+        model.add_module("output", nn.Linear(self.hidden_size, self.output_size))
+        model.add_module("softmax", nn.Softmax(dim=0))
+        return model
+
+    def forward(self, x):
+        return self.model(x)
+
+    def act(self, x):
+        return self.forward(x)
+
+    def logits(self, x):
+        return self.model[:-1](x)
+
+# the cartpole class.
+class cartpole:
+    def __init__(self, agent, batch_size=16, percentile=0.5, epochs=10):
+        self.env = gym.make("CartPole-v1")
+        self.agent = agent
+        self.batch_size = batch_size
+        self.percentile = percentile
+        self.epochs = epochs
+        return
+
+    def iterate(self):
+        batch = []
+        Episode = namedtuple("episode", ["steps", "reward"])
+        EpisodeStep = namedtuple("episodeStep", ["observation", "action"])
+        for i in range(self.batch_size):
+            episode_rewards = 0.0
+            episode_steps = []
+            obs, _ = self.env.reset()
+            while True:
+                obs_tensor = torch.tensor(obs)
+                action_proba = self.agent.act(obs_tensor).cpu().detach().numpy()
+                action = np.random.choice(2, p=action_proba)
+                episode_steps.append(EpisodeStep(obs, action))
+                obs, reward, terminated, truncated, _ = self.env.step(action)
+                episode_rewards += reward
+                if terminated or truncated:
+                    batch.append(Episode(episode_steps, episode_rewards))
+                    break
+        return batch
+
+    def filter(self, current_batch):
+        reward_list = list(map(lambda x: x.reward, current_batch))
+        reward_percentile = np.percentile(reward_list, self.percentile*100)
+        reward_mean = np.mean(reward_list)
+        train_obs, train_actions = [], []
+        for episode in current_batch:
+            if episode.reward > reward_percentile:
+                train_obs.extend(map(lambda x: x.observation, episode.steps))
+                train_actions.extend(map(lambda x: x.action, episode.steps))
+        return torch.tensor(train_obs), torch.tensor(train_actions), reward_mean, reward_percentile
+
+    def train(self):
+        loss_fn = nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(self.agent.model.parameters(), lr=0.01)
+        for epoch in range(self.epochs):
+            current_batch = self.iterate()
+            train_obs, train_actions, reward_mean, reward_percentile = self.filter(current_batch)
+            if reward_mean > 400:
+                print("Solved!")
+                break
+            print("Epoch "+str(epoch)+":", reward_mean, reward_percentile)
+            optimizer.zero_grad()
+            action_logits = self.agent.logits(train_obs)
+            loss = loss_fn(action_logits, train_actions)
+            loss.backward()
+            optimizer.step()
+        return self.agent
+
+
+# main
+if __name__ == "__main__":
+    print(torch.cuda.device(0))
+    torch.set_default_device("cuda")
+    print(torch.get_default_device())
+    output_agent = cartpole(NeuralNetworkAgent(), epochs=100).train()
+    envi = gym.make("CartPole-v1", render_mode="rgb_array")
+    envi = RecordVideo(envi, video_folder="cartpole-agent", name_prefix="eval",
+                      episode_trigger=lambda x: True)
+    envi = RecordEpisodeStatistics(envi, buffer_length=1)
+    obs, _ = envi.reset()
+    while True:
+        obs_tensor = torch.tensor(obs)
+        action_proba = output_agent.act(obs_tensor).cpu().detach().numpy()
+        action = np.random.choice(2, p=action_proba)
+        obs, reward, terminated, truncated, _ = envi.step(action)
+        if terminated or truncated:
+            break
+    envi.close()
+
+
